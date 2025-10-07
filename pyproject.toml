@@ -1,0 +1,19 @@
+[project]
+name = "otta"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.10.6",
+    "numpy>=2.3.3",
+    "pandas>=2.3.3",
+    "robustbench>=1.1.1",
+    "scikit-image>=0.25.2",
+    "scikit-learn>=1.7.2",
+    "seaborn>=0.13.2",
+    "timm>=1.0.9",
+    "torch>=2.8.0",
+    "torchvision>=0.23.0",
+    "tyro>=0.9.32",
+]
