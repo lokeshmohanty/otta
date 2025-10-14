@@ -1,7 +1,7 @@
 from loguru import logger
 from pathlib import Path
 import time
-import datetime
+from datetime import datetime
 from dataclasses import dataclass
 
 import numpy as np
@@ -13,60 +13,73 @@ from torch.utils.data import DataLoader
 from src.data import Cifar10, Cifar10C
 from src.utils import ExperimentTracker
 
+
+# ============================ Setup ================================
+@dataclass
 class HParams:
-    lr: float = 1e-3
-    batch_size: int = 100
+    lr: float = 3e-2
+    batch_size: int = 128
     n_workers: int = 4
-    n_iter: int = 800
+    n_iter: int = 8000
 
-model_name = "vit_base_patch16_224.orig_in21k_ft_in1k"
+dataset, model_name = "cifar10", "vit_base_patch16_224.orig_in21k_ft_in1k"
+@dataclass
 class Cfg:
-    model_name = model_name
-    weights_path = Path("models/cifar10") / model_name
+    model_name: str = model_name
+    dataset: str = dataset
+    weights_path: Path = Path("models") / dataset / (model_name + ".pt")
 
-uid = datetime.datetime.now()
-et = ExperimentTracker(f"CIFAR10C_vit_source_{uid}", cfg=Cfg, hparams=HParams)
+cfg, hparams = Cfg(), HParams()
 
-logger.add(f"logs/main_{uid}.log")
+uid = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+exp_name = f"cifar10c_vit_source"
+exp_path = Path(f"logs/exp_{uid}_{exp_name}")
+exp_path.mkdir(parents=True)
+et = ExperimentTracker(exp_path, cfg=vars(cfg), hparams=vars(hparams))
+logger.add(exp_path / "main.log")
+logger.info("Experiment: " + exp_name)
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def train(dataset, model, weights_path: Path, n_iter=HParams.n_iter, batch_size=HParams.batch_size):
+# =========================== Fine-tune Funciton ===========================
+def fineTune(dataset, model, weights_path: Path, n_iter=hparams.n_iter, batch_size=hparams.batch_size):
     weights_path.parent.mkdir(parents=True, exist_ok=True)
     if weights_path.exists():
         model.load_state_dict(torch.load(weights_path, weights_only=True))
-        return
-    # else:
-    data = DataLoader(dataset, batch_size=batch_size, num_workers=HParams.n_workers)
-    upsample = nn.Upsample((224, 224), mode="nearest")
-    optimizer = optim.SGD(model.parameters(), lr=HParams.lr, momentum=0.9)
+    else:
+        data = DataLoader(dataset, batch_size=batch_size, num_workers=hparams.n_workers)
+        upsample = nn.Upsample((224, 224), mode="nearest")
+        optimizer = optim.SGD(model.parameters(), lr=hparams.lr, momentum=0.9)
 
-    # for param in model.parameters():
-    #     param.requires_grad = False
-    # for param in model.head.parameters():
-    #     param.requires_grad = True
+        # for param in model.parameters():
+        #     param.requires_grad = False
+        # for param in model.head.parameters():
+        #     param.requires_grad = True
 
-    loss_sum = 0
-    logger.info(f"Train on {type(dataset).__name__} for {n_iter} iterations with batch size {batch_size}")
-    for i, (images, labels) in enumerate(data):
-        logits = model(upsample(images).to(device))
-        loss = nn.CrossEntropyLoss()(logits, labels.to(device))
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        loss_sum += loss
-        et.track(train_loss=loss)
-        if i == n_iter: break
-        if (i + 1) % 100 == 0:
-            loss_sum /= 100
-            logger.info(f"Iterations: [{i + 1}:{n_iter}] -> loss: {loss_sum:.4f}")
-            loss_sum = 0
+        loss_sum, i = 0, 0
+        logger.info(f"Train on {type(dataset).__name__} for {n_iter} iterations with batch size {batch_size}")
+        while(i < n_iter):
+            for images, labels in data:
+                logits = model(upsample(images).to(device))
+                loss = nn.CrossEntropyLoss()(logits, labels.to(device))
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                loss_sum += loss
+                i += 1
+                et.track(train_loss=loss.detach().cpu().numpy())
+                if (i + 1) % 100 == 0:
+                    loss_sum /= 100
+                    logger.info(f"Iterations: [{i + 1}:{n_iter}] -> loss: {loss_sum:.4f}")
+                    loss_sum = 0
+                if i == n_iter: break
 
-    torch.save(model.state_dict(), weights_path)
+        torch.save(model.state_dict(), weights_path)
 
-
-def eval(dataset, model, batch_size=HParams.batch_size):
-    data = dataset.load(batch_size=batch_size)
-    # data = DataLoader(dataset, batch_size=200, num_workers=8)
+# =================== Evaluate Function =============================
+def eval(dataset, model, batch_size=hparams.batch_size):
+    # data = dataset.load(batch_size=batch_size)
+    data = DataLoader(dataset, batch_size=batch_size, num_workers=hparams.n_workers)
     upsample = nn.Upsample((224, 224), mode="nearest")
 
     with torch.no_grad():
@@ -77,53 +90,77 @@ def eval(dataset, model, batch_size=HParams.batch_size):
             correct += (preds == labels.to(device)).float().sum()
         time_taken = time.time() - start_time
         acc = correct / len(dataset)
-    return acc.cpu(), time_taken
+    return acc.cpu().numpy(), time_taken
 
+# ========================= Main Function ===============================
+@logger.catch
 def main():
-    model = timm.create_model(Cfg.model_name, pretrained=True, num_classes=10).to(device)
+    model = timm.create_model(cfg.model_name, pretrained=True, num_classes=10).to(device)
+    fineTune(Cifar10(), model, cfg.weights_path)
 
-    # FineTune on Cifar10
-    train(Cifar10(), model, Cfg.weights_path)
-
+    # ------------ evaluate model -----------------
     test_data = Cifar10(test=True)
     acc, time_taken = eval(test_data, model)
     logger.info(f'Accuracy: {acc:.2%}, Time taken: {time_taken:.3f} s')
     logger.info(f'Samples: {len(test_data)}')
     err = 1. - acc
+    et.log({ "acc_source": acc, "tune_time_source": time_taken })
     logger.info(f'Source Error: {err:.2%}')
 
-
+    # ------------ Setup Adaptation ---------------
     # Adaptation Model
     # features: reset_each_shift
     # ROID / COTTA
+    logger.info(f'Adaptation: None')
 
     # Corruptions / Domains
-    corruptions = ["fog", "brightness"]
+    corruptions = [
+        "brightness",
+        "contrast",
+        "defocus_blur",
+        "elastic_transform",
+        "fog",
+        "frost",
+        "gaussian_blur",
+        "gaussian_noise",
+        "glass_blur",
+        "impulse_noise",
+        "jpeg_compression",
+        "motion_blur",
+        "pixelate",
+        "saturate",
+        "shot_noise",
+        "snow",
+        "spatter",
+        "speckle_noise",
+        "zoom_blur",
+    ]
 
     # severity, if gradual (only in corruption datasets)
     # severities = [1, 2, 3, 4, 5, 4, 3, 2, 1]
     # else
-    severities = [5]
+    severities = [1, 2, 3, 4, 5]
     errs = []
 
     # workers -> os.cpu_count()
+    # ------------ Evaluate on Target ---------------
     for corruption in corruptions:
-        dataset = Cifar10C(corruption=corruption, severity=severities[0])
-        acc, time_taken = eval(dataset, model)
+        for severity in severities:
+            dataset = Cifar10C(corruption=corruption, severity=severity)
+            acc, time_taken = eval(dataset, model)
 
-        logger.info(f"Evaluate on Cifar10C - {corruption}")
-        logger.info(f'Accuracy: {acc:.2%}, Time taken: {time_taken:.3f} s')
-        # logger.info(f'Parameter Count: {params / 1e6:.2f} M, GFLOPs: {flops / 1e9:.2f}')
-        logger.info(f'Samples: {len(dataset)}')
-        et.metrics[f"accuracy_{corruption}"] = acc
-        et.metrics[f"eval_time_{corruption}"] = time_taken
-        err = 1. - acc
-        errs.append(err)
-        logger.info(f'{corruption.upper()} error: {err:.2%}')
+            logger.info(f"Evaluate on Cifar10C - {corruption} - {severity}")
+            logger.info(f'Accuracy: {acc:.2%}, Time taken: {time_taken:.3f} s')
+            # logger.info(f'Parameter Count: {params / 1e6:.2f} M, GFLOPs: {flops / 1e9:.2f}')
+            logger.info(f'Samples: {len(dataset)}')
+            et.log({ f"acc_{corruption}_{severity}": acc, f"eval_time_{corruption}_{severity}": time_taken })
+            err = 1. - acc
+            errs.append(err)
+            logger.info(f'{corruption.upper()}_{severity} error: {err:.2%}')
     logger.info(f'Mean Error: {np.mean(errs):.2%}')
+    et.log({ "acc_mean": 1. - np.mean(errs)})
 
-
-
+    # ------------ Save adapted model ---------------
     # Save the model
     # import copy
     # best_model_weights = copy.deepcopy(model.state_dict())
