@@ -11,4 +11,4 @@ wheels/
 
 # IPython Notebooks
 .ipynb_checkpoints/*
-data
+.data

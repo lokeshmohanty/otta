@@ -11,6 +11,7 @@ import timm
 from torch.utils.data import DataLoader
 
 from src.data import Cifar10, Cifar10C
+from src.adaptations import CoTTA
 from src.utils import ExperimentTracker
 
 
@@ -21,6 +22,9 @@ class HParams:
     batch_size: int = 128
     n_workers: int = 4
     n_iter: int = 8000
+    adapt_alpha: int = 0.99
+    adapt_n_augs: int = 5
+    adapt_restore_threshold: float = 0.1
 
 dataset, model_name = "cifar10", "vit_base_patch16_224.orig_in21k_ft_in1k"
 @dataclass
@@ -28,11 +32,13 @@ class Cfg:
     model_name: str = model_name
     dataset: str = dataset
     weights_path: Path = Path("models") / dataset / (model_name + ".pt")
+    reset_each_shift: bool = True
+
 
 cfg, hparams = Cfg(), HParams()
 
 uid = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-exp_name = f"cifar10c_vit_source"
+exp_name = f"cifar10c_vit_cotta"
 exp_path = Path(f"logs/exp_{uid}_{exp_name}")
 exp_path.mkdir(parents=True)
 et = ExperimentTracker(exp_path, cfg=vars(cfg), hparams=vars(hparams))
@@ -51,6 +57,7 @@ def fineTune(dataset, model, weights_path: Path, n_iter=hparams.n_iter, batch_si
         upsample = nn.Upsample((224, 224), mode="nearest")
         optimizer = optim.SGD(model.parameters(), lr=hparams.lr, momentum=0.9)
 
+        # FineTune specific layers
         # for param in model.parameters():
         #     param.requires_grad = False
         # for param in model.head.parameters():
@@ -111,7 +118,8 @@ def main():
     # Adaptation Model
     # features: reset_each_shift
     # ROID / COTTA
-    logger.info(f'Adaptation: None')
+    logger.info(f'Adaptation: CoTTA')
+    model = CoTTA(model, hparams, device)
 
     # Corruptions / Domains
     corruptions = [
@@ -147,9 +155,8 @@ def main():
     for corruption in corruptions:
         for severity in severities:
             dataset = Cifar10C(corruption=corruption, severity=severity)
-            acc, time_taken = eval(dataset, model)
-
             logger.info(f"Evaluate on Cifar10C - {corruption} - {severity}")
+            acc, time_taken = eval(dataset, model, batch_size=10)
             logger.info(f'Accuracy: {acc:.2%}, Time taken: {time_taken:.3f} s')
             # logger.info(f'Parameter Count: {params / 1e6:.2f} M, GFLOPs: {flops / 1e9:.2f}')
             logger.info(f'Samples: {len(dataset)}')
