@@ -3,6 +3,7 @@ from pathlib import Path
 import time
 from datetime import datetime
 from dataclasses import dataclass
+from pprint import pprint
 
 import numpy as np
 import torch
@@ -10,8 +11,8 @@ from torch import nn, optim
 import timm
 from torch.utils.data import DataLoader
 
-from src.data import Cifar10, Cifar10C
-from src.adaptations import CoTTA
+from src.data import Cifar10CData, Cifar100CData
+from src.adaptations import Adaptation
 from src.utils import ExperimentTracker
 
 
@@ -19,31 +20,37 @@ from src.utils import ExperimentTracker
 @dataclass
 class HParams:
     lr: float = 3e-2
-    batch_size: int = 128
+    batch_size: int = 1
     n_workers: int = 4
     n_iter: int = 8000
     adapt_alpha: int = 0.99
     adapt_n_augs: int = 5
     adapt_restore_threshold: float = 0.1
 
-dataset, model_name = "cifar10", "vit_base_patch16_224.orig_in21k_ft_in1k"
+dataset = Cifar100CData
+model_name = "vit_base_patch16_224.orig_in21k_ft_in1k"
+
 @dataclass
 class Cfg:
+    dataset = dataset
     model_name: str = model_name
-    dataset: str = dataset
-    weights_path: Path = Path("models") / dataset / (model_name + ".pt")
+    adaptation: Adaptation | None = Adaptation.cotta # None 
+    weights_path: Path = Path("models") / dataset.name[:-1] / (model_name + ".pt")
+    n_classes: int = dataset.n_classes
     reset_each_shift: bool = True
 
 
 cfg, hparams = Cfg(), HParams()
 
 uid = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
-exp_name = f"cifar10c_vit_cotta"
+exp_name = f"{cfg.dataset.name}_{cfg.model_name.split('_')[0]}_{cfg.adaptation.name}"
 exp_path = Path(f"logs/exp_{uid}_{exp_name}")
 exp_path.mkdir(parents=True)
 et = ExperimentTracker(exp_path, cfg=vars(cfg), hparams=vars(hparams))
 logger.add(exp_path / "main.log")
 logger.info("Experiment: " + exp_name)
+logger.info(cfg)
+logger.info(hparams)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -102,12 +109,12 @@ def eval(dataset, model, batch_size=hparams.batch_size):
 # ========================= Main Function ===============================
 @logger.catch
 def main():
-    model = timm.create_model(cfg.model_name, pretrained=True, num_classes=10).to(device)
-    fineTune(Cifar10(), model, cfg.weights_path)
+    source_model = timm.create_model(cfg.model_name, pretrained=True, num_classes=cfg.n_classes).to(device)
+    fineTune(cfg.dataset.source(), source_model, cfg.weights_path)
 
     # ------------ evaluate model -----------------
-    test_data = Cifar10(test=True)
-    acc, time_taken = eval(test_data, model)
+    test_data = cfg.dataset.source(test=True)
+    acc, time_taken = eval(test_data, source_model)
     logger.info(f'Accuracy: {acc:.2%}, Time taken: {time_taken:.3f} s')
     logger.info(f'Samples: {len(test_data)}')
     err = 1. - acc
@@ -118,8 +125,9 @@ def main():
     # Adaptation Model
     # features: reset_each_shift
     # ROID / COTTA
-    logger.info(f'Adaptation: CoTTA')
-    model = CoTTA(model, hparams, device)
+    if cfg.adaptation:
+        logger.info(f'Adaptation: ', cfg.adaptation.name)
+        model = cfg.adaptation(source_model, hparams, device)
 
     # Corruptions / Domains
     corruptions = [
@@ -147,15 +155,20 @@ def main():
     # severity, if gradual (only in corruption datasets)
     # severities = [1, 2, 3, 4, 5, 4, 3, 2, 1]
     # else
-    severities = [1, 2, 3, 4, 5]
+    severities = [1, 2, 3, 4, 5, 4, 3, 2, 1]
     errs = []
 
     # workers -> os.cpu_count()
     # ------------ Evaluate on Target ---------------
     for corruption in corruptions:
+        corr_err = 0
+        if cfg.reset_each_shift and cfg.adaptation:
+            logger.info(f'Reset Adaptation: ', cfg.adaptation.name)
+            model = cfg.adaptation(source_model, hparams, device)
+
         for severity in severities:
-            dataset = Cifar10C(corruption=corruption, severity=severity)
-            logger.info(f"Evaluate on Cifar10C - {corruption} - {severity}")
+            dataset = cfg.dataset.data(corruption=corruption, severity=severity)
+            logger.info(f"Evaluate on {cfg.dataset.name} - {corruption} - {severity}")
             acc, time_taken = eval(dataset, model, batch_size=10)
             logger.info(f'Accuracy: {acc:.2%}, Time taken: {time_taken:.3f} s')
             # logger.info(f'Parameter Count: {params / 1e6:.2f} M, GFLOPs: {flops / 1e9:.2f}')
@@ -163,15 +176,13 @@ def main():
             et.log({ f"acc_{corruption}_{severity}": acc, f"eval_time_{corruption}_{severity}": time_taken })
             err = 1. - acc
             errs.append(err)
+            corr_err += err
             logger.info(f'{corruption.upper()}_{severity} error: {err:.2%}')
+        et.log({ f"acc_{corruption}": 1. - (corr_err/len(severities))})
+        if cfg.adaptation:
+            et.save_model(model.student, f"model_adapted_{corruption}.pth")
     logger.info(f'Mean Error: {np.mean(errs):.2%}')
     et.log({ "acc_mean": 1. - np.mean(errs)})
-
-    # ------------ Save adapted model ---------------
-    # Save the model
-    # import copy
-    # best_model_weights = copy.deepcopy(model.state_dict())
-    # torch.save(best_model_weights, f"{corruption}_{severities[0]}_{model_arch}.pth")
 
 
 if __name__ == "__main__":

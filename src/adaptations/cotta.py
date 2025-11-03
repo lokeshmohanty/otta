@@ -17,6 +17,7 @@ from torchvision.transforms import v2 as tt
 from .util import consistencyLoss
 
 class CoTTA():
+    name = "CoTTA"
     def __init__(self, model, hparams, device):
         super(CoTTA).__init__()
         self.student = model.to(device)

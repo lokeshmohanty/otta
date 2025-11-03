@@ -1,6 +1,9 @@
 import atexit
 import pickle
 from pathlib import Path
+import copy
+import torch
+
 
 class ExperimentTracker():
     def __init__(self, path: Path, cfg: dict, hparams: dict):
@@ -28,7 +31,12 @@ class ExperimentTracker():
             else:
                 self.tracks[k] = [v]
 
+    def save_model(self, model, name):
+        model_weights = copy.deepcopy(model.state_dict())
+        torch.save(model_weights, self.path.parent / name)
+
     def exit(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.path, 'wb') as f:
             pickle.dump({
                 "cfg": self.cfg,
